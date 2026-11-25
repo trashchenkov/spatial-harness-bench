@@ -265,8 +265,13 @@ def main(argv=None):
                 completed = subprocess.run(invocation(block, args, command, image, target, run_id),
                                            check=False, stdout=logs, stderr=subprocess.STDOUT,
                                            env={**os.environ, "SPATIAL_SUITE_DIAGNOSTICS":
-                                                str(output / f"{block.name}.diagnostics.jsonl")})
+                                                str(output / f"{block.name}.diagnostics.jsonl"),
+                                                "SPATIAL_SUITE_ATTEMPTS":
+                                                str(output / "attempts" / block.name)})
             row.update(summary(target, completed.returncode, args.agent), returncode=completed.returncode)
+            attempt_dir = output / "attempts" / block.name
+            if attempt_dir.is_dir():
+                row["attempts"] = str(attempt_dir.relative_to(output))
             save()
         report["status"] = ("technical_error" if any(r["status"] == "technical_error" for r in report["blocks"])
                             else "complete")

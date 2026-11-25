@@ -25,6 +25,32 @@ class ToolViolation(TransportError):
 
 DIAGNOSTIC = re.compile(rb"^spatial-native: ([a-z][a-z0-9_]{0,47})(?: http_status=([1-5][0-9]{2}))?$", re.MULTILINE)
 
+PARTIAL_PREFIX = b"spatial-native-partial: "
+PARTIAL_LIMIT = 16 * 1024
+
+
+def partial_text(agent, data):
+    result = ""
+    for record in events(data):
+        if agent == "codex":
+            item = record.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                result = item["text"]
+        elif record.get("type") == "text":
+            part = record.get("part")
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                result += part["text"]
+        if len(result) >= PARTIAL_LIMIT:
+            break
+    return result
+
+
+def report_partial(text):
+    if text:
+        clipped = text.encode("utf-8", errors="replace")[:PARTIAL_LIMIT].decode("utf-8", errors="ignore")
+        sys.stderr.buffer.write(PARTIAL_PREFIX + (json.dumps(clipped, ensure_ascii=False) + "\n").encode())
+        sys.stderr.buffer.flush()
+
 
 def diagnostics(stderr):
     for code, status in DIAGNOSTIC.findall(stderr):
@@ -157,6 +183,7 @@ class Native:
         self.server = None
         self.address = None
         self.env = None
+        self.partial = ""
 
     def start_server(self):
         # The listener is private to this worker container. It is never published.
@@ -207,9 +234,18 @@ class Native:
                 cmd += ["--session", self.session]
             elif not ephemeral:
                 cmd += ["--title", "Spatial Benchmark Episode"]
-        result = subprocess.run(cmd, input=prompt.encode(), check=False, capture_output=True,
-                                timeout=self.timeout, env=self.env)
-        self.session, text = parse_turn(self.agent, result, self.session)
+        self.partial = ""
+        try:
+            result = subprocess.run(cmd, input=prompt.encode(), check=False, capture_output=True,
+                                    timeout=self.timeout, env=self.env)
+        except subprocess.TimeoutExpired as exc:
+            self.partial = partial_text(self.agent, exc.stdout or b"")
+            raise
+        try:
+            self.session, text = parse_turn(self.agent, result, self.session)
+        except TransportError:
+            self.partial = partial_text(self.agent, result.stdout)
+            raise
         return text
 
 
@@ -228,6 +264,7 @@ class Pi:
         self.model, self.command, self.timeout = model, command, timeout
         self.process = None
         self.buffer = bytearray()
+        self.partial = ""
 
     def close(self):
         if self.process is None:
@@ -265,6 +302,7 @@ class Pi:
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             )
         packet = json.dumps({"type": "prompt", "message": prompt}, ensure_ascii=False).encode() + b"\n"
+        self.partial = ""
         self.process.stdin.write(packet)
         self.process.stdin.flush()
         deadline = monotonic() + self.timeout
@@ -274,10 +312,18 @@ class Pi:
             while True:
                 event = self.read_event(ready, deadline)
                 kind = event.get("type")
+                if kind == "message_update":
+                    delta = event.get("assistantMessageEvent") or {}
+                    if (isinstance(delta, dict) and delta.get("type") == "text_delta"
+                            and isinstance(delta.get("delta"), str)):
+                        self.partial = (self.partial + delta["delta"])[:PARTIAL_LIMIT]
                 if kind == "response" and not event.get("success"):
                     raise TransportError("rpc_rejected")
                 if kind == "message_end" and event.get("message", {}).get("role") == "assistant":
                     message = event["message"]
+                    self.partial = "".join(block["text"] for block in (message.get("content") or [])
+                                           if isinstance(block, dict) and block.get("type") == "text"
+                                           and isinstance(block.get("text"), str))[:PARTIAL_LIMIT] or self.partial
                     if message.get("stopReason") in {"error", "aborted"}:
                         error = message.get("errorMessage")
                         status = re.search(r"(?:^|\b)([45][0-9]{2}) (?:status code|HTTP\b)", error) if isinstance(error, str) else None
@@ -308,21 +354,26 @@ def main():
                 text = transport.turn(turn_prompt(req))
                 print(json.dumps(response(req, text), ensure_ascii=False), flush=True)
     except ProviderError as exc:
+        report_partial(transport.partial)
         status = exc.args[0] if len(exc.args) == 1 and type(exc.args[0]) is int else None
         report_failure("provider_error", status)
         if mode == "session":
             print('{"type":"gateway_error","exhausted":true,"attempts":1}', flush=True)
         return 75
     except subprocess.TimeoutExpired:
+        report_partial(transport.partial)
         report_failure("turn_timeout")
         return 70
     except ToolViolation:
+        report_partial(transport.partial)
         report_failure("unexpected_tool_call")
         return 70
     except TransportError as exc:
+        report_partial(transport.partial)
         report_failure(exc.args[0] if exc.args else "invalid_native_turn")
         return 70
     except (OSError, ValueError):
+        report_partial(transport.partial)
         report_failure("native_io_or_protocol_error")
         return 70
     finally:
